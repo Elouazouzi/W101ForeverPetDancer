@@ -41,6 +41,26 @@ MIDI_TO_KEY = {
 
 KEY_PRESS_DELAY = 0.25
 # ---------------------------------------------------
+
+def get_wasapi_loopback_device():
+    import sounddevice as sd
+
+    hostapis = sd.query_hostapis()
+    wasapi_index = next(
+        i for i, h in enumerate(hostapis) if h["name"] == "Windows WASAPI"
+    )
+
+    devices = sd.query_devices()
+    for i, d in enumerate(devices):
+        if (
+            d["hostapi"] == wasapi_index
+            and d["max_output_channels"] > 0
+        ):
+            return i
+
+    raise RuntimeError("No WASAPI output device found")
+
+
 def get_audio_source():
     if sys.platform.startswith("linux"):
         try:
@@ -146,17 +166,19 @@ def run_listener():
                 yield np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
     else:
-        import sounddevice as sd
-        q = queue.Queue()
 
-        def callback(indata, frames, time_info, status):
-            q.put(indata[:, 0].copy())
+        import sounddevice as sd
+
+        device_index = get_wasapi_loopback_device()
+        print(f"Using WASAPI loopback device #{device_index}")
 
         stream = sd.InputStream(
+            device=device_index,
             samplerate=SAMPLE_RATE,
             channels=1,
             blocksize=FRAME_SIZE,
             callback=callback,
+            extra_settings=sd.WasapiSettings(loopback=True),
         )
         stream.start()
 
