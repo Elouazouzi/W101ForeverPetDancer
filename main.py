@@ -169,6 +169,10 @@ def run_listener():
 
         import sounddevice as sd
 
+        q = queue.Queue()
+        def callback(indata, frames, time_info, status):
+            q.put(indata[:, 0].copy())
+
         device_index = get_wasapi_loopback_device()
         print(f"Using WASAPI loopback device #{device_index}")
 
