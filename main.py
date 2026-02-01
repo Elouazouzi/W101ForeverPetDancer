@@ -3,6 +3,8 @@
 system_note_keyer_daemon.py - Fixed for repeated notes + noise rejection
 """
 
+import sys
+import queue
 import subprocess
 import numpy as np
 import math
@@ -11,15 +13,16 @@ from collections import deque
 import shutil
 import argparse
 
+from pynput.keyboard import Controller, Key
+
 # ----------------- Config / tuning -----------------
 SAMPLE_RATE = 44100
 FRAME_SIZE = 1024 
 FMIN, FMAX = 50.0, 2000.0
 
-# INCREASED THRESHOLDS to stop random inputs
-ENERGY_THRESHOLD = 0.005  # Ignore low-level background hum
-CONFIDENCE_THRESHOLD = 0.5 # Autocorrelation must be very clear
-TOLERANCE_CENTS = 40      # How close to the exact note you must be
+ENERGY_THRESHOLD = 0.005  
+CONFIDENCE_THRESHOLD = 0.5 
+TOLERANCE_CENTS = 40      
 
 SMOOTH_WINDOW = 4       
 STABLE_FRAMES_FOR_ON = 3
@@ -38,15 +41,18 @@ MIDI_TO_KEY = {
 
 KEY_PRESS_DELAY = 0.25
 # ---------------------------------------------------
-
-def get_monitor_source():
-    try:
-        info = subprocess.check_output(["pactl", "info"], text=True)
-        for line in info.splitlines():
-            if line.startswith("Default Sink:"):
-                return line.split()[-1] + ".monitor"
-    except: pass
-    return "auto_null.monitor" # Fallback
+def get_audio_source():
+    if sys.platform.startswith("linux"):
+        try:
+            info = subprocess.check_output(["pactl", "info"], text=True)
+            for line in info.splitlines():
+                if line.startswith("Default Sink:"):
+                    return ("pulse", line.split()[-1] + ".monitor")
+        except:
+            pass
+        return ("pulse", None)
+    else:
+        return ("sounddevice", None)
 
 def freq_to_midi_float(freq):
     return 69.0 + 12.0 * math.log2(freq / 440.0)
@@ -57,9 +63,7 @@ def get_closest_target(freq):
     midi_float = freq_to_midi_float(freq)
     midi_int = int(round(midi_float))
     
-    # Check if it's a target note
     if midi_int in TARGET_NOTES:
-        # Check if it's 'in tune' enough to be real
         cents_off = abs(midi_float - midi_int) * 100
         if cents_off < TOLERANCE_CENTS:
             return midi_int
@@ -88,24 +92,21 @@ def detect_pitch_autocorr(frame):
     return SAMPLE_RATE / peak_idx, confidence
 
 # ----- Key sending -----
-try:
-    from pynput.keyboard import Controller, Key
-    KBD = Controller()
-    PYNPUT_AVAILABLE = True
-except:
-    PYNPUT_AVAILABLE = False
-
-XDOTOOL_AVAILABLE = shutil.which("xdotool") is not None
+KBD = Controller()
+KEY_MAP = {
+    "Left": Key.left,
+    "Right": Key.right,
+    "Up": Key.up,
+    "Down": Key.down,
+}
 
 def send_key_name(keyname):
-    if PYNPUT_AVAILABLE:
-        key_map = {"Left": Key.left, "Right": Key.right, "Up": Key.up, "Down": Key.down}
-        if keyname in key_map:
-            KBD.press(key_map[keyname])
-            time.sleep(0.03)
-            KBD.release(key_map[keyname])
-    elif XDOTOOL_AVAILABLE:
-        subprocess.run(["xdotool", "key", keyname])
+    key = KEY_MAP.get(keyname)
+    if not key:
+        return
+    KBD.press(key)
+    time.sleep(0.03)
+    KBD.release(key)
 
 def action_send_keys(sequence):
     if not sequence: return
@@ -116,14 +117,12 @@ def action_send_keys(sequence):
             send_key_name(keyname)
             time.sleep(KEY_PRESS_DELAY)
 
-def run_listener():
-    monitor = get_monitor_source()
-    print(f"Listening on {monitor}...")
 
-    parec = subprocess.Popen(
-        ["parec", "-d", monitor, "--format=s16le", "--rate", str(SAMPLE_RATE), "--channels", "1"],
-        stdout=subprocess.PIPE, bufsize=0
-    )
+
+
+def run_listener():
+    backend, monitor = get_audio_source()
+    print(f"Audio backend: {backend}")
 
     smooth_buf = deque(maxlen=SMOOTH_WINDOW)
     collected = []
@@ -131,24 +130,50 @@ def run_listener():
     stable_on_count = 0
     stable_off_count = 0
 
-    try:
-        while True:
-            raw = parec.stdout.read(FRAME_SIZE * 2)
-            if not raw: break
+    if backend == "pulse":
+        print(f"Listening on {monitor}...")
+        parec = subprocess.Popen(
+            ["parec", "-d", monitor, "--format=s16le",
+             "--rate", str(SAMPLE_RATE), "--channels", "1"],
+            stdout=subprocess.PIPE, bufsize=0
+        )
 
-            audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        def audio_frames():
+            while True:
+                raw = parec.stdout.read(FRAME_SIZE * 2)
+                if not raw:
+                    break
+                yield np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+    else:
+        import sounddevice as sd
+        q = queue.Queue()
+
+        def callback(indata, frames, time_info, status):
+            q.put(indata[:, 0].copy())
+
+        stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            blocksize=FRAME_SIZE,
+            callback=callback,
+        )
+        stream.start()
+
+        def audio_frames():
+            while True:
+                yield q.get()
+
+    try:
+        for audio in audio_frames():
             freq, conf = detect_pitch_autocorr(audio)
-            
-            # Immediately filter for our 4 target notes
             current_midi = get_closest_target(freq)
             smooth_buf.append(current_midi)
-            
-            # Get the most common note in our window (majority rules)
+
             counts = np.bincount(smooth_buf) if any(smooth_buf) else [0]
             smoothed = np.argmax(counts)
 
             if active_note == 0:
-                # Waiting for a note to start
                 if smoothed != 0:
                     stable_on_count += 1
                     if stable_on_count >= STABLE_FRAMES_FOR_ON:
@@ -161,15 +186,13 @@ def run_listener():
                             collected.clear()
                 else:
                     stable_on_count = 0
-                    # If silent for a while, flush the buffer
                     if collected:
                         stable_off_count += 1
-                        if stable_off_count > 12: # ~0.3 seconds
+                        if stable_off_count > 12:
                             action_send_keys(collected)
                             collected.clear()
                             stable_off_count = 0
             else:
-                # Waiting for note to end (silence or change)
                 if smoothed != active_note:
                     stable_off_count += 1
                     if stable_off_count >= STABLE_FRAMES_FOR_OFF:
@@ -182,7 +205,12 @@ def run_listener():
     except KeyboardInterrupt:
         print("\nStopping.")
     finally:
-        parec.terminate()
+        if backend == "pulse":
+            parec.terminate()
+        else:
+            stream.stop()
+            stream.close()
+
 
 if __name__ == "__main__":
     run_listener()
